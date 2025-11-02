@@ -1,0 +1,360 @@
+<html lang="en"><head>
+<link rel="stylesheet" href="../css_styles/site_style2.css">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Poem generator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;900&amp;display=swap" rel="stylesheet">
+
+<link rel="icon" href="../visuals/amadesdev.png">
+<link rel="stylesheet" href="../scripts/hljs/styles/atom-one-light.css">
+<script src="../scripts/hljs/highlight.js"></script>
+
+<body>
+<main>
+<div id="nav">
+    <h2 style="font-size:18px;"><a href="../index.html">Projects</a></h2>
+    <h2 style="font-size:18px;"><a href="./about_me.html">About Me</a></h2>
+</div>
+
+<section>
+<p style="font-size:74px; text-align: center;" class="body-text"><b>Poem generator</b></p>
+<p style="font-size: 16px" class="body-text"><i>Aleksander Majkowski</i></p>
+
+<p class="body-text">
+    In this project, I developed a statistical text generative model designed to imitate highly specific literary style — in this case, the poetry of William Shakespeare. 
+    We could use pre-trained "black box" large language models, even their fine tuning requires significant computational resources, inferences requires very strong, 
+    in the case of stronger models not a consumer grade GPU units, and their exact mechanism by which they work so well is not fully understood yet. 
+<br><br>
+So to avoid some of these bottlenecks while achieving pretty decent results I built this system from first principles using high-order Markov chains. 
+The goal was to demonstrate how classical stochastic processes can effectively capture complex linguistic patterns, syntax, and rhythm when applied with sufficient depth.
+
+The corpus of all Shakespeare's writings has been obtained from <a rel="noopener noreferrer" href="https://www.gutenberg.org/cache/epub/100/pg100.txt" target="blank"><b>here</b></a>.
+<br><br>
+The core of my implementation is a Mixture Markov Model. While standard N-gram models often suffer from data sparsity 
+(where a specific long sequence of words never repeats, causing the model to "get stuck"), my implementation solves this by evaluating multiple context lengths simultaneously.
+The Mechanism: The model doesn't just look at the preceding 4 words (mlag=4); it looks at the preceding 4, 3, 2, and 1 words in parallel.
+Weighted backoff calculates the probability of the next word across all these orders and combines them. This ensures that if a specific 4-word phrase 
+is unique to the source text, the model can seamlessly "back off" to a 3-word or 2-word context to find a plausible continuation, maintaining fluidity without copying standard text verbatim.
+<br><br>
+Quality generation depends entirely on the quality of the input data. I engineered pre-processing pipeline to convert the raw Shakespeare corpus into a usable statistical format:
+Remove non-linguistic elements, such as stage directions (e.g., [Exit]) and character headers, ensuring the model only learned from actual verse.
+A design decision was treating punctuation marks (.,;!?) as individual tokens. This allows the model to learn sentence structure and rhythm, rather than just word-to-word associations.
+Finalized data was transformed into a lagged integer matrix. This matrix effectively serves as a 5-dimensional map of the text, linking every sequence of four words to every possible 
+following word found in the corpus.
+<br><br>
+The final model successfully generates multi-stanza poems that adhere to defined structures (e.g., 5, 8, and 3-sentence paragraphs). accurately mimicking Shakespearian 
+vocabulary and archaic sentence structures.
+</p>
+<br><br>
+<p style="font-size: 20px; text-align: center;" class="body-text"><b>Python code: Poem_generator.py</b></p>
+<div class="code-container">
+<button class="toggle-code-button" align="center">Show code</button>
+
+<pre id="python-code-cont" class="python-code-cont"><code class="language-python">
+import re
+import numpy as np
+import random
+from collections import Counter
+
+# --- FILE LOADING AND CORPUS PREPARATION ---
+
+# We want to include into our generator parts of shakespire.txt which are strictly poems
+START_INDEX = 83
+END_INDEX = 196043
+
+try:
+    with open("shakespeare.txt", "r", encoding="utf-8") as f:
+        # Read all lines into a list
+        all_lines = f.readlines()
+except FileNotFoundError:
+    print("Error: 'shakespeare.txt' not found. Please make sure the file is in the same directory as the script.")
+    exit()
+
+# Filter the text using list slicing
+target_lines = all_lines[START_INDEX:END_INDEX]
+raw_text = "".join(target_lines)
+a = re.findall(r'\S+', raw_text)
+
+# --- 1. CORPUS PREPARATION & TOKENIZATION (Cleaning) ---
+
+# Stage Direction Removal
+def remove_stage_directions(tokens):
+    a = tokens
+    lb = [i for i, token in enumerate(a) if token == "["] # Find all the indices of left brackets
+    left_idx = []
+    right_idx = []
+
+    for l in lb:
+        # Try to find a right bracket within 100 tokens
+        sub_list = a[l : l + 101]
+        try:
+            rb_relative_idx = sub_list.index("]")
+        except ValueError:
+            # Handles the case where there is a missing right bracket within 100 tokens
+            continue
+
+        left_idx.append(l)
+        # Calculate the position in the original vector a
+        right_idx.append(l + rb_relative_idx)
+
+    # Storing indices of brackets to remove
+    remove_idx = set()
+    for l, r in zip(left_idx, right_idx):
+        for i in range(l, r + 1): # +1 because range is exclusive
+            remove_idx.add(i)
+
+    # Removing stage brackets
+    a_cleaned = [token for i, token in enumerate(a) if i not in remove_idx]
+    return a_cleaned
+
+a = remove_stage_directions(a) # Remove stage directions from the text
+
+# Remove fully upper case words (except "I" and "A")
+is_upper = [token == token.upper() and bool(token) for token in a]
+exception = [token in ["I", "A"] for token in a]
+to_remove = [iu and not exc for iu, exc in zip(is_upper, exception)]
+
+a = [token for i, token in enumerate(a) if not to_remove[i]] # Remove fully upper case words
+
+# Remove words containing Arabic numbers
+a = [token for token in a if not re.search(r'[0-9]', token)] # Remove words that contain Arabic numbers
+
+
+# Function to split punctuations, which we treat as seperate characters or "tokens"
+def split_punct(words, puncs):
+    # Create a regex pattern: (anything not-punctuation) + (a single punctuation char at end)
+    puncs_escaped = re.escape("".join(puncs))
+    pattern = rf"^(.*)([{puncs_escaped}])$"
+
+    separated_tokens = []
+    for word in words:
+        match = re.match(pattern, word)
+        if match:
+            # Group 1: word stem, Group 2: punctuation
+            stem, punc = match.groups()
+            if stem:
+                separated_tokens.append(stem)
+            separated_tokens.append(punc)
+        else:
+            separated_tokens.append(word)
+    return separated_tokens
+
+puncs = [".", ",", ";", "!", "?", ":"] # Define the punctuation characters to be separated
+a = split_punct(a, puncs) # Separate the punctuation from the words
+
+a = [token.lower() for token in a] # Convert all words to lower case
+
+
+# --- 2. MARKOV MODEL CONSTRUCTION (Vocabulary and Matrix) ---
+
+# Tokenisation and unique words count
+word_counts = Counter(a)
+uniq = list(word_counts.keys())
+word_counts_list = np.array([word_counts[w] for w in uniq]) # Aligned counts
+
+# Finding 1000 most common words
+top_n = 1000
+top_words_counts = word_counts.most_common(top_n)
+b = [word for word, count in top_words_counts] # Vector b of common words
+
+# Tokenasing our word vector so that it takes less space in memory
+b_map = {word: i + 1 for i, word in enumerate(b)}
+mat = np.array([b_map.get(token, 0) for token in a], dtype=int) # Tokenized vector
+
+mlag = 4 #Set mlag value for our matrix
+
+# Finding our Matrix dimensions
+mat_np = mat
+n_rows = len(mat_np) - mlag
+n_cols = mlag + 1
+M = np.empty((n_rows, n_cols), dtype=int) # Pre-allocate matrix
+
+# Created lagged matrix M of our words. First column is our b vector then we have lagged vector b from lag = 1 to lag = 4.
+for i in range(mlag + 1): # i from 0 to mlag
+    # Slice 'mat' to create the columns of M (lagged tokens)
+    M[:, i] = mat_np[i : n_rows + i]
+
+
+# --- 3. SENTENCE SYNTHESIS (Next Word Generation Function) ---
+
+# R function next.word translation
+def next_word(key, M, mat_np, b, b_map, mlag, w=None):
+    """
+    Generate a word token according to a word sequence (key) using a mixture Markov model.
+    :param key: A list of words (current sequence) for which the next word is to be generated.
+    :param M: The Markov transition matrix (token sequences).
+    :param mat_np: The full tokenized text (for fallback frequency).
+    :param b: The vector of common words.
+    :param b_map: The map from common word to 1-based token index.
+    :param mlag: The maximum lag/order of the Markov model.
+    :param w: The vector of mixture weights (length mlag).
+    :return: A single 1-based word token index.
+    """
+    top_n = len(b)
+    if w is None:
+        w = np.ones(mlag) # Default weights are 1 for all orders
+
+    l = len(key)
+    if l > mlag:
+        key = key[l - mlag:] # reduce key length to width of our matrix
+
+    key = [token.lower() for token in key]
+    # Tokenize key (v) - 1-based indices, 0 for unknown
+    v = np.array([b_map.get(token, 0) for token in key])
+
+    u = [] # Stores the m+1th token index (j in R)
+    up = [] # Stores the probabilities for the corresponding token in u
+
+    # Loop over Markov chain orders k, from current sequence length down to 1
+    current_v = v.copy()
+
+    for k in range(len(v), 0, -1): # k = len(v), len(v)-1, ..., 1
+        v_match = current_v[-k:]
+
+        # M columns to match: M[:, (mlag - k) : mlag]
+        M_match_cols = M[:, (mlag - k) : mlag]
+
+        # Find matching rows: np.all checks if all elements in the slice match v_match
+        matches = np.all(M_match_cols == v_match, axis=1)
+        rs = np.where(matches)[0] # Indices of matching rows
+
+        # Subsequent word token
+        j = M[rs, mlag]
+
+        # Filter out NA objects (0 in our mat/M)
+        j = j[j != 0]
+
+        # Weight for order k: w[k-1] (0-based)
+        weight = w[k - 1]
+
+        if len(j) > 0:
+            u.extend(j.tolist()) # Concatenate j to the u vector
+            # Probability: w_k / n_j
+            up.extend([weight / len(j)] * len(j))
+
+        # Remove the first element of v
+        current_v = current_v[1:]
+
+    # Fallback if u is empty (sample based on overall frequency of common words)
+    if not u:
+        # Calculate frequency counts of common tokens (1 to top_n) in the entire text (mat_np)
+        mat_common = mat_np[mat_np != 0]
+        # np.bincount gives counts for indices 0, 1, 2, ...
+        # Index 1 corresponds to token 1 (word b[0])
+        freq_counts = np.bincount(mat_common)
+
+        # Frequencies for tokens 1..top_n
+        freq = freq_counts[1:top_n + 1]
+
+        # Normalize and sample a 1-based token index (1 to top_n)
+        # Since we sample index 0..top_n-1, we add 1 to get the token
+        sampled_index_in_b = np.random.choice(top_n, 1, p=freq/np.sum(freq))[0]
+        t = sampled_index_in_b + 1
+    else:
+        # Sample token from u according to the mixture probability up
+        total_prob = sum(up)
+        if total_prob == 0:
+            t = np.random.choice(u, 1)[0]
+        else:
+            probs_normalized = np.array(up) / total_prob
+            t = np.random.choice(u, 1, p=probs_normalized)[0]
+
+    return int(t) # Returns a 1-based token index (int)
+
+def generate_sentence(b, b_map, M, mat_np, mlag, max_length=50):
+    """Generates a single formatted sentence."""
+    word_tokens = [w for w in b if w not in puncs]
+    if not word_tokens:
+        raise ValueError("No common non-punctuation words found for starting the sentence.")
+
+    start_word = random.choice(word_tokens)
+    sentence_tokens = [start_word]
+
+    # Terminal punctuations to end a sentence
+    terminal_punctuations = {".", "!", "?"}
+
+    while True:
+        key = sentence_tokens
+        next_token_index = next_word(key, M, mat_np, b, b_map, mlag=mlag)
+        next_word_str = b[next_token_index - 1]
+        sentence_tokens.append(next_word_str)
+
+        if next_word_str in terminal_punctuations or len(sentence_tokens) >= max_length:
+            break
+
+    sentence = " ".join(sentence_tokens)
+    sentence_formatted = re.sub(r'\s+([.,;!?:])', r'\1', sentence)
+    if sentence_formatted:
+        sentence_formatted = sentence_formatted[0].upper() + sentence_formatted[1:]
+
+    return sentence_formatted
+
+
+def generate_poem(structure, b, b_map, M, mat_np, mlag):
+    """
+    Generates a poem with a given paragraph structure.
+    :param structure: A list of integers, where each integer is the number of sentences in a paragraph.
+                      e.g., [5, 8, 3]
+    """
+    print("Generated poem:")
+    print()
+    for num_sentences in structure:
+        paragraph = []
+        for _ in range(num_sentences):
+            sentence = generate_sentence(b, b_map, M, mat_np, mlag)
+            paragraph.append(sentence)
+        
+        # Join sentences and capitalize letters after terminal punctuation
+        full_paragraph = " ".join(paragraph)
+        
+        def capitalize_match(match):
+            return match.group(1) + match.group(2) + match.group(3).upper()
+
+        pattern = r'([.?!])(\s+)([a-z])'
+        full_paragraph_formatted = re.sub(pattern, capitalize_match, full_paragraph)
+        
+        print(full_paragraph_formatted)
+        print() # Adds a newline for the next paragraph
+
+# --- 4. EXECUTION AND OUTPUT ---
+poem_structure = [5, 8, 3]
+generate_poem(poem_structure, b, b_map, M, mat_np, mlag)
+</code></pre>
+<script>
+    hljs.highlightAll();
+</script>
+
+<button class="copy-button" type="button">
+<img class="copy-image" src="../visuals/button.jpg" alt="Copy Button" style="margin: 0 auto; width: 20px; height: 20px;">
+<span class="copy-message">Copied!</span>
+<div class="button-dim-overlay"></div></button>
+<script src="../scripts/copy.js"></script>
+</section>
+</div>
+
+<br><br>
+<p class="body-text"> 
+While pure Markov models lack true semantic understanding — occasionally resulting in grammatically sound but logically absurd 
+sentences, this project successfully demonstrates their power in computational stylistics, effectively capturing the 
+"texture" of a complex author without the massive compute resources required by modern neural networks.
+
+<br><br>
+
+<b>Generated example:<br></b><i>
+Goes to that with haste will make it but a shadow, as i am so often you and your fair show shall not with more after our blood! Bears goes on my face. Side, and entreat you to? Myself would for he was a made old but the cause, if your pure a mind that doth make him shake off a first so noble wife any other form, their eyes do weep! Crown his, take away her life; i am ha, ha! 
+<br><br>
+Where bloody murder, to mortal touch throw death how mine own, i may not go without you to our court of them. Field, and yet find little. Hearing be no great in fortune give me trust to’t. Lost, quite lost their issue stand: it. Were day should not you there was or brought a king, not you, i warrant your grace you may as yourself shall welcome home. Toward her ever most kind and noble. Wear a woman after this, let the heart and in heart, i think not what shall i am too mean a subject low as to say so much. Fools by thy hand, thou didst hate her eye, your hand, sir.
+<br><br>
+Hear the cause, not we, then such vile company till he was a man as he. Said, being done! Fresh as any of this.
+<br><br></i>
+
+<b>Another example:<br></b><i>
+Believe thee in his heart than when i first. Feel it his spirit; which nature could not find me in, madam! Shalt find, the other to the earth with his head. Roman gods with the prince your brother that truly, wild, faith, brother, yet the moon may it be a quarrel between us. Twenty could but kill not all together at my tent, where is.
+<br><br>
+Present him sleep. World, i wish your highness a very excellent piece of this present death. Unto an enemy of gloucester and his wife by the wind, and make us think rather say i am no proud of ’em never more to arm. Soldiers, dear queen. Kiss and all that they bear the knave, in my brother too! Sense, for were you, madam, we’ll have with her to my proud heart: in witness, take the worst to be so valiant. Attend those two hot passion of that which we will bring him to her. Enough between you!        
+<br><br>
+Sleep neither. Company, which, i myself and we’ll reason with hector. Mock at death with as great a better hope, which you have had him.
+</i>
+</p><br><br><br><br></div></section></body></html>
